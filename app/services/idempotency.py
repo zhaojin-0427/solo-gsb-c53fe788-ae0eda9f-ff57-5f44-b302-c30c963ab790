@@ -19,8 +19,13 @@ before any business work):
      * FAILED -> one peer wins an UPDATE election back to PENDING (new
        run_token, any fingerprint) and becomes the retry leader; the others
        loop and attach;
-     * PENDING whose FOR UPDATE lock is held -> a live leader: same
-       fingerprint waits in phase 2, different fingerprint gets 409 now;
+     * PENDING whose FOR UPDATE lock is held -> a live leader: the
+       same/different-payload decision is re-judged against the CURRENT
+       committed owner's fingerprint (the row is re-read with
+       ``populate_existing``, because an expired placeholder may have been
+       reclaimed -- new fingerprint committed -- by the very peer now
+       holding the lock after our unlocked read): same fingerprint waits
+       in phase 2, different fingerprint gets 409 now;
      * PENDING whose lock is free -> either the millisecond-wide hand-off
        gap right after a claim commits, or a crash leftover older than
        ``TS_IDEMPOTENCY_PENDING_TTL_MS`` (reclaimed, attempts bumped).
@@ -321,10 +326,39 @@ async def _claim_in_own_transaction(
                 await cs.commit()
                 return _Claim(leader=True, run_token=token)
 
-            # Lock is held by a live leader's open business transaction.
-            if not same_fp:
+            # The lock is held by a live leader's open business transaction.
+            # The row classified above may predate a takeover: an expired
+            # PENDING placeholder can be reclaimed (new fingerprint
+            # committed) by a peer after our unlocked read, and that peer is
+            # then the lock holder our probe just lost to. The
+            # same/different-payload decision must therefore be re-judged
+            # against the CURRENT committed owner's fingerprint -- re-read
+            # the row (populate_existing defeats the identity map) instead of
+            # trusting the possibly stale snapshot, or a request carrying the
+            # owner's exact payload would be wrongly refused 409.
+            current = await _read(cs, scope, key)
+
+            if current.state == IdempotencyState.COMPLETED.value:
+                # The leader finished between the probe and this re-read.
+                if current.request_hash != request_hash:
+                    raise _conflict(key)
+                return _Claim(
+                    leader=False,
+                    run_token=None,
+                    status_code=current.status_code,
+                    body=current.response_body,
+                )
+
+            if current.state == IdempotencyState.FAILED.value:
+                # The leader failed in that window: contest the re-election.
+                continue
+
+            # Still PENDING under the live leader: ``current.request_hash``
+            # is the committed owner's authoritative fingerprint.
+            if current.request_hash != request_hash:
                 raise _conflict(key)
-            # Same payload: phase 2 blocks on the lock and replays / retries.
+            # Same payload as the current owner: phase 2 blocks on the lock
+            # and replays / retries.
             return _Claim(leader=False, run_token=token)
 
 

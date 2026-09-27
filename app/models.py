@@ -185,6 +185,13 @@ class IdempotencyKey(Base):
     under the FOR UPDATE lock it acquires (``populate_existing``), so a row
     that COMPLETED while the peer was classifying is never reclaimed: its
     fingerprint, status code and response body stay the first writer's.
+    Symmetrically, when the probe finds the row lock held by a live leader,
+    the same/different-payload decision is re-judged against the CURRENT
+    committed owner's fingerprint (fresh ``populate_existing`` re-read): a
+    peer may have reclaimed the expired placeholder -- committing a new
+    fingerprint -- and become the lock holder after our first unlocked read,
+    so judging on that stale snapshot would wrongly refuse a request that
+    carries the new owner's exact payload.
     """
 
     __tablename__ = "idempotency_keys"

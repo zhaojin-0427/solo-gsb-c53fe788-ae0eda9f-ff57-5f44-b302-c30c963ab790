@@ -1185,6 +1185,410 @@ async def test_failed_reelection_loop_terminates_and_replays(client, monkeypatch
 
 
 # ---------------------------------------------------------------------------
+# Placeholder reclaim vs. live business lock (controlled interleaving)
+#
+# Regression tests for the stale-fingerprint misjudgement: a same-key request
+# reads an EXPIRED PENDING placeholder carrying the old fingerprint; before
+# its SKIP LOCKED probe runs, a peer reclaims the placeholder with a new
+# fingerprint, commits the claim, and takes the business row lock. The first
+# request's probe then comes back empty (lock held by the new owner) and the
+# same/different-payload decision must be re-judged against the CURRENT
+# committed owner's fingerprint -- never the stale pre-takeover one --
+# otherwise a request carrying the owner's exact payload is wrongly refused
+# 409 IDEMPOTENCY_CONFLICT.
+# ---------------------------------------------------------------------------
+
+
+def _hook_reclaim_interleaving(monkeypatch, scope, router_module, attr,
+                               business_side_effect=None):
+    """Deterministically reproduce the reclaim/business-lock interleaving.
+
+    * the first phase-1 read of the scope's PENDING row (the follower's read
+      of the expired placeholder with the old fingerprint) parks until the
+      test releases it -- i.e. the follower's SKIP LOCKED probe only runs
+      after the reclaimer committed its claim AND took the business lock;
+    * the entry point's business (``router_module.attr``) is gated so the
+      reclaimer holds the business row lock until the test releases it;
+      ``business_side_effect`` (if given) is raised by the first call.
+
+    Returns (placeholder_seen, business_entered, release_probe,
+    release_business, calls).
+    """
+    import asyncio
+
+    from app.services import idempotency
+
+    placeholder_seen = asyncio.Event()
+    business_entered = asyncio.Event()
+    release_probe = asyncio.Event()
+    release_business = asyncio.Event()
+    calls = {"n": 0}
+
+    original_business = getattr(router_module, attr)
+
+    async def gated_business(*args, **kwargs):
+        calls["n"] += 1
+        business_entered.set()
+        # Hold the business transaction (and with it the claim row lock) open
+        # until the follower has probed and classified against the new owner.
+        await release_business.wait()
+        if business_side_effect is not None and calls["n"] == 1:
+            raise business_side_effect
+        return await original_business(*args, **kwargs)
+
+    monkeypatch.setattr(router_module, attr, gated_business)
+
+    original_read = idempotency._read
+    parked = {"done": False}
+
+    async def parked_read(session, scope_, key_):
+        row = await original_read(session, scope_, key_)
+        if (
+            not parked["done"]
+            and scope_ == scope
+            and row is not None
+            and row.state == "PENDING"
+        ):
+            parked["done"] = True
+            placeholder_seen.set()
+            # Park between the unlocked read and the SKIP LOCKED probe; the
+            # peer reclaims the placeholder (new fingerprint) and takes the
+            # business row lock in between.
+            await release_probe.wait()
+        return row
+
+    monkeypatch.setattr(idempotency, "_read", parked_read)
+    return placeholder_seen, business_entered, release_probe, release_business, calls
+
+
+def _seed_expired_pending(scope, key, old_fingerprint_payload):
+    """Insert a crash-leftover PENDING row with an old (different) fingerprint."""
+    from app.models import IdempotencyKey, utcnow
+    from app.services.idempotency import hash_payload
+
+    async def seed():
+        async with SessionLocal() as session:
+            session.add(
+                IdempotencyKey(
+                    scope=scope,
+                    key=key,
+                    request_hash=hash_payload(scope, old_fingerprint_payload),
+                    state="PENDING",
+                    attempts=1,
+                    locked_at=utcnow() - timedelta(minutes=10),
+                )
+            )
+            await session.commit()
+
+    return seed()
+
+
+async def test_reclaim_race_same_payload_waits_and_replays(client, monkeypatch):
+    """A crash-leftover PENDING row (old fingerprint) is reclaimed by a peer
+    with a new fingerprint while a same-key request carrying the SAME payload
+    as the reclaimer is still classifying: its SKIP LOCKED probe loses to the
+    new owner's business lock, and it must wait and replay the owner's exact
+    response -- not be refused 409 on the stale fingerprint."""
+    import asyncio
+
+    from app.main import app
+    from app.routers import ingest as ingest_router
+    from app.schemas import BatchIngestIn
+    from app.services.idempotency import hash_payload
+
+    trace = "tr-reclaim-same"
+    scope = f"ingest:{trace}"
+    key = {"Idempotency-Key": "reclaim-same-key"}
+    payload = {"spans": [span_payload("root")]}
+
+    await _seed_expired_pending(scope, "reclaim-same-key",
+                                {"spans": [{"span_id": "crashed-owner"}]})
+
+    (placeholder_seen, business_entered, release_probe,
+     release_business, calls) = _hook_reclaim_interleaving(
+        monkeypatch, scope, ingest_router, "ingest_spans"
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as c:
+        # The follower reads the expired placeholder (old fingerprint) and
+        # parks before its takeover probe.
+        follower = asyncio.create_task(
+            c.post(f"/v1/traces/{trace}/spans", json=payload, headers=key)
+        )
+        await asyncio.wait_for(placeholder_seen.wait(), 5)
+        # The reclaimer takes the placeholder over with the new fingerprint,
+        # commits the claim and holds the business row lock.
+        reclaimer = asyncio.create_task(
+            c.post(f"/v1/traces/{trace}/spans", json=payload, headers=key)
+        )
+        await asyncio.wait_for(business_entered.wait(), 5)
+        # The follower's probe now comes back empty (lock held by the new
+        # owner). It must re-judge against the owner's committed fingerprint
+        # (same payload) and wait -- a stale-fingerprint 409 would surface
+        # here, long before the business ends.
+        release_probe.set()
+        await asyncio.sleep(0.3)
+        assert not follower.done(), (
+            "same-payload follower was refused instead of waiting for the owner"
+        )
+        release_business.set()
+        reclaimer_resp = await asyncio.wait_for(reclaimer, 5)
+        follower_resp = await asyncio.wait_for(follower, 5)
+
+    assert reclaimer_resp.status_code == 201
+    assert follower_resp.status_code == 201
+    assert follower_resp.headers.get("x-idempotent-replay") == "true"
+    assert follower_resp.json() == reclaimer_resp.json()
+    assert calls["n"] == 1, "business must run exactly once"
+
+    detail = (await client.get(f"/v1/traces/{trace}")).json()
+    assert len(detail["spans"]) == 1
+
+    # Ledger consistency: exactly one crash-leftover takeover (attempts 2);
+    # the completed row carries the reclaimer's fingerprint and response.
+    row = await _fetch_idempotency_row(scope, "reclaim-same-key")
+    assert row.state == "COMPLETED"
+    assert row.request_hash == hash_payload(
+        scope, BatchIngestIn(**payload).model_dump(mode="json")
+    )
+    assert row.status_code == 201
+    assert row.response_body["stored"] == 1
+    assert row.response_body["results"] == [
+        {"span_id": "root", "outcome": "stored"}
+    ]
+    assert row.attempts == 2
+
+    # The key now replays the owner's payload and conflicts everything else.
+    replay = await client.post(f"/v1/traces/{trace}/spans", json=payload, headers=key)
+    assert replay.status_code == 201
+    assert replay.headers.get("x-idempotent-replay") == "true"
+    assert replay.json() == reclaimer_resp.json()
+    conflict = await client.post(
+        f"/v1/traces/{trace}/spans",
+        json={"spans": [span_payload("other", duration_ms=999)]},
+        headers=key,
+    )
+    assert conflict.status_code == 409
+
+
+async def test_reclaim_race_different_payload_conflicts_without_waiting(
+    client, monkeypatch
+):
+    """Same interleaving, but the parked follower carries a DIFFERENT payload
+    than the reclaimer: once its probe loses to the new owner's business lock
+    it must get 409 IDEMPOTENCY_CONFLICT immediately -- judged against the
+    reclaimer's committed fingerprint, without waiting for the business
+    transaction to end."""
+    import asyncio
+
+    from app.main import app
+    from app.routers import ingest as ingest_router
+    from app.schemas import BatchIngestIn
+    from app.services.idempotency import hash_payload
+
+    trace = "tr-reclaim-conflict"
+    scope = f"ingest:{trace}"
+    key = {"Idempotency-Key": "reclaim-conflict-key"}
+    payload_owner = {"spans": [span_payload("root")]}
+    payload_other = {"spans": [span_payload("other", duration_ms=999)]}
+
+    await _seed_expired_pending(scope, "reclaim-conflict-key",
+                                {"spans": [{"span_id": "crashed-owner"}]})
+
+    (placeholder_seen, business_entered, release_probe,
+     release_business, calls) = _hook_reclaim_interleaving(
+        monkeypatch, scope, ingest_router, "ingest_spans"
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as c:
+        follower = asyncio.create_task(
+            c.post(f"/v1/traces/{trace}/spans", json=payload_other, headers=key)
+        )
+        await asyncio.wait_for(placeholder_seen.wait(), 5)
+        reclaimer = asyncio.create_task(
+            c.post(f"/v1/traces/{trace}/spans", json=payload_owner, headers=key)
+        )
+        await asyncio.wait_for(business_entered.wait(), 5)
+        release_probe.set()
+        # The 409 must come back while the owner's business is still gated.
+        follower_resp = await asyncio.wait_for(follower, 5)
+        assert not reclaimer.done(), "owner business finished before the 409"
+        release_business.set()
+        reclaimer_resp = await asyncio.wait_for(reclaimer, 5)
+
+    assert follower_resp.status_code == 409
+    assert follower_resp.json()["detail"]["error"] == "IDEMPOTENCY_CONFLICT"
+    assert reclaimer_resp.status_code == 201
+    assert calls["n"] == 1, "different-payload request must never run the business"
+
+    detail = (await client.get(f"/v1/traces/{trace}")).json()
+    assert [s["span_id"] for s in detail["spans"]] == ["root"]
+
+    # Ledger consistency: the completed row kept the reclaimer's fingerprint
+    # and response; exactly one takeover.
+    row = await _fetch_idempotency_row(scope, "reclaim-conflict-key")
+    assert row.state == "COMPLETED"
+    assert row.request_hash == hash_payload(
+        scope, BatchIngestIn(**payload_owner).model_dump(mode="json")
+    )
+    assert row.status_code == 201
+    assert row.attempts == 2
+
+    replay = await client.post(
+        f"/v1/traces/{trace}/spans", json=payload_owner, headers=key
+    )
+    assert replay.status_code == 201
+    assert replay.headers.get("x-idempotent-replay") == "true"
+    assert replay.json() == reclaimer_resp.json()
+    again = await client.post(
+        f"/v1/traces/{trace}/spans", json=payload_other, headers=key
+    )
+    assert again.status_code == 409
+
+
+async def test_reclaim_race_business_failure_reelects_waiter(client, monkeypatch):
+    """Same interleaving, but the reclaimer's business FAILS while the
+    same-payload follower waits on the lock: the row flips to FAILED, the
+    follower wins the re-election and retries the business exactly once,
+    completing the key; the ledger records the retried attempt's response."""
+    import asyncio
+
+    from fastapi import HTTPException
+
+    from app.main import app
+    from app.routers import ingest as ingest_router
+    from app.schemas import BatchIngestIn
+    from app.services.idempotency import hash_payload
+
+    trace = "tr-reclaim-retry"
+    scope = f"ingest:{trace}"
+    key = {"Idempotency-Key": "reclaim-retry-key"}
+    payload = {"spans": [span_payload("root")]}
+
+    await _seed_expired_pending(scope, "reclaim-retry-key",
+                                {"spans": [{"span_id": "crashed-owner"}]})
+
+    boom = HTTPException(
+        status_code=409,
+        detail={"error": "SPAN_CONFLICT", "message": "injected business failure"},
+    )
+    (placeholder_seen, business_entered, release_probe,
+     release_business, calls) = _hook_reclaim_interleaving(
+        monkeypatch, scope, ingest_router, "ingest_spans",
+        business_side_effect=boom,
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as c:
+        follower = asyncio.create_task(
+            c.post(f"/v1/traces/{trace}/spans", json=payload, headers=key)
+        )
+        await asyncio.wait_for(placeholder_seen.wait(), 5)
+        reclaimer = asyncio.create_task(
+            c.post(f"/v1/traces/{trace}/spans", json=payload, headers=key)
+        )
+        await asyncio.wait_for(business_entered.wait(), 5)
+        release_probe.set()
+        await asyncio.sleep(0.3)
+        assert not follower.done(), (
+            "same-payload follower was refused instead of waiting for the owner"
+        )
+        # The owner's business fails: SAVEPOINT rollback + FAILED published in
+        # the same transaction; the waiting follower re-elects and retries.
+        release_business.set()
+        reclaimer_resp = await asyncio.wait_for(reclaimer, 5)
+        follower_resp = await asyncio.wait_for(follower, 5)
+
+    assert reclaimer_resp.status_code == 409
+    assert reclaimer_resp.json()["detail"]["error"] == "SPAN_CONFLICT"
+    assert follower_resp.status_code == 201
+    assert follower_resp.json()["stored"] == 1
+    assert calls["n"] == 2, "one failed attempt plus one controlled retry"
+
+    detail = (await client.get(f"/v1/traces/{trace}")).json()
+    assert len(detail["spans"]) == 1
+
+    # Ledger consistency: the retried attempt completed the key with the
+    # payload's fingerprint; the FAILED re-election is not a crash takeover
+    # (attempts stays at the reclaimer's 2).
+    row = await _fetch_idempotency_row(scope, "reclaim-retry-key")
+    assert row.state == "COMPLETED"
+    assert row.request_hash == hash_payload(
+        scope, BatchIngestIn(**payload).model_dump(mode="json")
+    )
+    assert row.status_code == 201
+    assert row.attempts == 2
+
+    replay = await client.post(f"/v1/traces/{trace}/spans", json=payload, headers=key)
+    assert replay.status_code == 201
+    assert replay.headers.get("x-idempotent-replay") == "true"
+    assert replay.json() == follower_resp.json()
+
+
+async def test_reclaim_race_end_entry_waits_and_replays(client, monkeypatch):
+    """The /end idempotent entry point shares the fixed judgement: under the
+    same reclaim/business-lock interleaving the same-payload follower waits
+    and replays the owner's published decision instead of being refused."""
+    import asyncio
+
+    from app.main import app
+    from app.routers import ingest as ingest_router
+    from app.services.idempotency import hash_payload
+
+    trace = "tr-reclaim-end"
+    scope = f"end:{trace}"
+    key = {"Idempotency-Key": "reclaim-end-key"}
+    await _post_spans(client, trace, [span_payload("root")])
+
+    await _seed_expired_pending(scope, "reclaim-end-key", {"old": "payload"})
+
+    (placeholder_seen, business_entered, release_probe,
+     release_business, calls) = _hook_reclaim_interleaving(
+        monkeypatch, scope, ingest_router, "finalize_trace"
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as c:
+        follower = asyncio.create_task(
+            c.post(f"/v1/traces/{trace}/end", headers=key)
+        )
+        await asyncio.wait_for(placeholder_seen.wait(), 5)
+        reclaimer = asyncio.create_task(
+            c.post(f"/v1/traces/{trace}/end", headers=key)
+        )
+        await asyncio.wait_for(business_entered.wait(), 5)
+        release_probe.set()
+        await asyncio.sleep(0.3)
+        assert not follower.done(), (
+            "same-payload follower was refused instead of waiting for the owner"
+        )
+        release_business.set()
+        reclaimer_resp = await asyncio.wait_for(reclaimer, 5)
+        follower_resp = await asyncio.wait_for(follower, 5)
+
+    assert reclaimer_resp.status_code == 201
+    assert follower_resp.status_code == 201
+    assert follower_resp.headers.get("x-idempotent-replay") == "true"
+    assert follower_resp.json() == reclaimer_resp.json()
+    assert calls["n"] == 1, "finalization must run exactly once"
+
+    decisions = (await client.get(f"/v1/traces/{trace}/revisions")).json()
+    assert len(decisions) == 1
+
+    row = await _fetch_idempotency_row(scope, "reclaim-end-key")
+    assert row.state == "COMPLETED"
+    assert row.request_hash == hash_payload(scope, {})
+    assert row.status_code == 201
+    assert row.attempts == 2
+
+
+# ---------------------------------------------------------------------------
 # Real-HTTP concurrency (subprocess uvicorn, real TCP, OS threads): timing,
 # exactly-once business execution, and controlled retry after rollback.
 # ---------------------------------------------------------------------------
