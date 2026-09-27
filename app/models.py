@@ -185,6 +185,11 @@ class IdempotencyKey(Base):
     under the FOR UPDATE lock it acquires (``populate_existing``), so a row
     that COMPLETED while the peer was classifying is never reclaimed: its
     fingerprint, status code and response body stay the first writer's.
+    Likewise, when the probe finds the row locked by a live leader, the
+    same/different-payload decision is made on a fresh re-read of the
+    current committed owner's fingerprint -- never on the possibly stale
+    snapshot read before a peer's takeover committed -- so a request whose
+    payload matches the current owner is never refused with a spurious 409.
     """
 
     __tablename__ = "idempotency_keys"

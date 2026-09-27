@@ -19,8 +19,12 @@ before any business work):
      * FAILED -> one peer wins an UPDATE election back to PENDING (new
        run_token, any fingerprint) and becomes the retry leader; the others
        loop and attach;
-     * PENDING whose FOR UPDATE lock is held -> a live leader: same
-       fingerprint waits in phase 2, different fingerprint gets 409 now;
+     * PENDING whose FOR UPDATE lock is held -> a live leader: the row is
+       re-read (``populate_existing``) because the first read may be a
+       stale snapshot taken before a peer reclaimed an expired placeholder
+       and committed its own fingerprint; the *current committed owner's*
+       fingerprint decides -- same payload waits in phase 2, different
+       payload gets 409 now;
      * PENDING whose lock is free -> either the millisecond-wide hand-off
        gap right after a claim commits, or a crash leftover older than
        ``TS_IDEMPOTENCY_PENDING_TTL_MS`` (reclaimed, attempts bumped).
@@ -38,6 +42,15 @@ before any business work):
    object and its "reclaim" UPDATE would rewrite the fingerprint of the
    completed row while keeping its response -- replaying the first writer's
    result for a different-payload request instead of returning 409.
+
+   Symmetrically, when the SKIP LOCKED probe finds the row locked (a live
+   leader holds it), the fingerprint compared against the request is
+   re-read from the latest committed row -- never the stale snapshot from
+   the first read. Otherwise a request that read an expired placeholder
+   with the old fingerprint, then lost the row to a peer that reclaimed it
+   with a *new* fingerprint matching this request's payload, would be
+   misjudged against the old fingerprint and wrongly refused with 409
+   instead of waiting for the current owner and replaying its response.
 
 Phase 2 -- the *business* (the request's own session/transaction):
 
@@ -322,7 +335,37 @@ async def _claim_in_own_transaction(
                 return _Claim(leader=True, run_token=token)
 
             # Lock is held by a live leader's open business transaction.
-            if not same_fp:
+            # The row classified above may be STALE by now: a peer can
+            # reclaim an expired placeholder (writing its own fingerprint),
+            # commit the takeover and take the business lock, all between
+            # our first read and this probe. Judging on the stale
+            # fingerprint would wrongly 409 a request whose payload matches
+            # the *current* committed owner. Re-read the latest committed
+            # row (populate_existing: the identity map still holds the stale
+            # snapshot) and decide on the live owner's fingerprint.
+            current = await _read(cs, scope, key)
+
+            if current.state == IdempotencyState.FAILED.value:
+                # The owner failed between the probe and this re-read:
+                # contest the atomic re-election on authoritative state.
+                continue
+
+            if current.state == IdempotencyState.COMPLETED.value:
+                # The owner finished between the probe and this re-read.
+                # The completed ledger row is immutable: replay it (same
+                # payload) or conflict (different payload).
+                if current.request_hash != request_hash:
+                    raise _conflict(key)
+                return _Claim(
+                    leader=False,
+                    run_token=None,
+                    status_code=current.status_code,
+                    body=current.response_body,
+                )
+
+            # Still PENDING and locked by the live owner: judge on ITS
+            # fingerprint, never on the stale snapshot.
+            if current.request_hash != request_hash:
                 raise _conflict(key)
             # Same payload: phase 2 blocks on the lock and replays / retries.
             return _Claim(leader=False, run_token=token)

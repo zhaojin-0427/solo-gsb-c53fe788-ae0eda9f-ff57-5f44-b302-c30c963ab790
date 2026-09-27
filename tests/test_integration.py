@@ -1185,6 +1185,372 @@ async def test_failed_reelection_loop_terminates_and_replays(client, monkeypatch
 
 
 # ---------------------------------------------------------------------------
+# Placeholder takeover vs. live business lock (controlled interleaving)
+#
+# Regression tests for the stale-fingerprint misjudgment: a request reads an
+# EXPIRED PENDING placeholder carrying the OLD fingerprint; before its
+# takeover probe runs, a peer reclaims the placeholder with a NEW
+# fingerprint, commits the claim and takes the business row lock. The first
+# request's SKIP LOCKED probe then finds the row locked -- it must re-read
+# the current committed owner's fingerprint instead of judging on the stale
+# snapshot, or a request carrying the new owner's payload is wrongly refused
+# with 409 IDEMPOTENCY_CONFLICT.
+# ---------------------------------------------------------------------------
+
+
+async def _seed_stale_pending(scope, key, request_hash):
+    """Plant a crash-leftover PENDING placeholder (owner gone, lock free)."""
+    from app.models import IdempotencyKey, utcnow
+
+    async with SessionLocal() as session:
+        session.add(
+            IdempotencyKey(
+                scope=scope,
+                key=key,
+                request_hash=request_hash,
+                state="PENDING",
+                attempts=1,
+                locked_at=utcnow() - timedelta(minutes=10),
+            )
+        )
+        await session.commit()
+
+
+def _hook_takeover_lock_interleaving(
+    monkeypatch, scope, stale_hash, router_module, attr, fail_first_business=False
+):
+    """Pin the takeover-vs-business-lock interleaving with barriers.
+
+    * the first phase-1 read returning the STALE placeholder (fingerprint
+      ``stale_hash``) parks before its SKIP LOCKED probe runs -- that reader
+      is the request that saw the expired row with the old fingerprint;
+    * the entry point's business (``router_module.attr``) parks on its first
+      invocation while holding the claim-row FOR UPDATE lock, so the parked
+      request's probe finds the row locked by the NEW owner;
+    * any later phase-1 read returning a PENDING row with a different
+      fingerprint is the parked request's re-read of the current committed
+      owner (the fix) and trips ``owner_fingerprint_seen``.
+
+    With ``fail_first_business`` the parked business raises a 503 once
+    released, so the waiting request must re-elect and retry.
+
+    Returns (reader_parked, release_reader, owner_in_business,
+    release_business, owner_fingerprint_seen, calls).
+    """
+    import asyncio
+
+    from fastapi import HTTPException
+
+    from app.services import idempotency
+
+    reader_parked = asyncio.Event()
+    release_reader = asyncio.Event()
+    owner_in_business = asyncio.Event()
+    release_business = asyncio.Event()
+    owner_fingerprint_seen = asyncio.Event()
+    calls = {"n": 0}
+
+    original_business = getattr(router_module, attr)
+
+    async def gated_business(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # The new owner holds the claim-row lock for its whole business
+            # transaction; keep it open until the parked reader's probe has
+            # found the row locked.
+            owner_in_business.set()
+            await release_business.wait()
+            if fail_first_business:
+                raise HTTPException(status_code=503, detail="injected failure")
+        return await original_business(*args, **kwargs)
+
+    monkeypatch.setattr(router_module, attr, gated_business)
+
+    original_read = idempotency._read
+    parked = {"done": False}
+
+    async def gated_read(session, scope_, key_):
+        row = await original_read(session, scope_, key_)
+        if scope_ == scope and row is not None:
+            if not parked["done"] and row.request_hash == stale_hash:
+                # The parked reader's first look at the expired placeholder
+                # (old fingerprint): hold it here so the peer can reclaim
+                # the row and commit its own claim first.
+                parked["done"] = True
+                reader_parked.set()
+                await release_reader.wait()
+            elif row.request_hash != stale_hash and row.state == "PENDING":
+                # The parked reader's re-read of the CURRENT committed
+                # owner's fingerprint after its probe found the row locked.
+                owner_fingerprint_seen.set()
+        return row
+
+    monkeypatch.setattr(idempotency, "_read", gated_read)
+    return (
+        reader_parked,
+        release_reader,
+        owner_in_business,
+        release_business,
+        owner_fingerprint_seen,
+        calls,
+    )
+
+
+async def test_takeover_lock_race_same_payload_waits_and_replays(client, monkeypatch):
+    """The exact defect: the follower reads the expired placeholder with the
+    old fingerprint, a peer reclaims it with a NEW fingerprint equal to the
+    follower's payload and takes the business lock. The follower's probe
+    finds the row locked; judging on the stale fingerprint would 409 it.
+    Instead it must wait for the owner and replay the identical response."""
+    import asyncio
+
+    from app.main import app
+    from app.routers import ingest as ingest_router
+    from app.schemas import BatchIngestIn
+    from app.services.idempotency import hash_payload
+
+    trace = "tr-takeover-lock-same"
+    scope = f"ingest:{trace}"
+    key_name = "takeover-lock-same-key"
+    key = {"Idempotency-Key": key_name}
+    payload = {"spans": [span_payload("root")]}
+    stale_hash = hash_payload(scope, {"spans": [{"span_id": "stale-leftover"}]})
+    await _seed_stale_pending(scope, key_name, stale_hash)
+
+    (
+        reader_parked,
+        release_reader,
+        owner_in_business,
+        release_business,
+        owner_fingerprint_seen,
+        calls,
+    ) = _hook_takeover_lock_interleaving(
+        monkeypatch, scope, stale_hash, ingest_router, "ingest_spans"
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as c:
+        follower = asyncio.create_task(
+            c.post(f"/v1/traces/{trace}/spans", json=payload, headers=key)
+        )
+        # The follower read the stale placeholder and parked before probing.
+        await asyncio.wait_for(reader_parked.wait(), 5)
+        owner = asyncio.create_task(
+            c.post(f"/v1/traces/{trace}/spans", json=payload, headers=key)
+        )
+        # The owner reclaimed the placeholder (its fingerprint == payload),
+        # committed the claim and now holds the business row lock.
+        await asyncio.wait_for(owner_in_business.wait(), 5)
+        release_reader.set()
+        # The follower's SKIP LOCKED probe finds the row locked; the fix
+        # re-reads the current owner's fingerprint (== follower's payload).
+        await asyncio.wait_for(owner_fingerprint_seen.wait(), 5)
+        # Same payload as the live owner: the follower is blocked on the
+        # business transaction and cannot respond before the owner commits.
+        assert not follower.done()
+        release_business.set()
+        owner_resp, follower_resp = await asyncio.wait_for(
+            asyncio.gather(owner, follower), 5
+        )
+
+    assert owner_resp.status_code == 201
+    assert follower_resp.status_code == 201
+    assert follower_resp.headers.get("x-idempotent-replay") == "true"
+    assert follower_resp.json() == owner_resp.json()
+    assert calls["n"] == 1, "business must run exactly once"
+
+    detail = (await client.get(f"/v1/traces/{trace}")).json()
+    assert len(detail["spans"]) == 1
+
+    # Ledger consistency: exactly one crash-leftover takeover (attempts
+    # 1 -> 2); the completed row carries the current owner's fingerprint,
+    # status code and response body.
+    row = await _fetch_idempotency_row(scope, key_name)
+    assert row.state == "COMPLETED"
+    assert row.request_hash == hash_payload(
+        scope, BatchIngestIn(**payload).model_dump(mode="json")
+    )
+    assert row.status_code == 201
+    assert row.response_body["stored"] == 1
+    assert row.response_body["results"] == [{"span_id": "root", "outcome": "stored"}]
+    assert row.attempts == 2
+
+    # The key now replays the owner's response and conflicts anything else.
+    replay = await client.post(f"/v1/traces/{trace}/spans", json=payload, headers=key)
+    assert replay.status_code == 201
+    assert replay.headers.get("x-idempotent-replay") == "true"
+    assert replay.json() == owner_resp.json()
+    conflict = await client.post(
+        f"/v1/traces/{trace}/spans",
+        json={"spans": [span_payload("other", duration_ms=999)]},
+        headers=key,
+    )
+    assert conflict.status_code == 409
+
+
+async def test_takeover_lock_race_different_payload_conflicts_without_waiting(
+    client, monkeypatch
+):
+    """Same interleaving, but the parked request carries a payload that
+    differs from the new owner's: it must get 409 IDEMPOTENCY_CONFLICT
+    immediately -- while the owner's business transaction is still open --
+    and must never run the business."""
+    import asyncio
+
+    from app.main import app
+    from app.routers import ingest as ingest_router
+    from app.schemas import BatchIngestIn
+    from app.services.idempotency import hash_payload
+
+    trace = "tr-takeover-lock-diff"
+    scope = f"ingest:{trace}"
+    key_name = "takeover-lock-diff-key"
+    key = {"Idempotency-Key": key_name}
+    owner_payload = {"spans": [span_payload("root")]}
+    other_payload = {"spans": [span_payload("other", duration_ms=999)]}
+    stale_hash = hash_payload(scope, {"spans": [{"span_id": "stale-leftover"}]})
+    await _seed_stale_pending(scope, key_name, stale_hash)
+
+    (
+        reader_parked,
+        release_reader,
+        owner_in_business,
+        release_business,
+        owner_fingerprint_seen,
+        calls,
+    ) = _hook_takeover_lock_interleaving(
+        monkeypatch, scope, stale_hash, ingest_router, "ingest_spans"
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as c:
+        follower = asyncio.create_task(
+            c.post(f"/v1/traces/{trace}/spans", json=other_payload, headers=key)
+        )
+        await asyncio.wait_for(reader_parked.wait(), 5)
+        owner = asyncio.create_task(
+            c.post(f"/v1/traces/{trace}/spans", json=owner_payload, headers=key)
+        )
+        await asyncio.wait_for(owner_in_business.wait(), 5)
+        release_reader.set()
+        # The follower's probe finds the row locked by the owner; it
+        # re-reads the owner's fingerprint, sees the mismatch and 409s --
+        # all while the owner's business transaction is still parked open,
+        # which proves the 409 did not wait for the business to finish.
+        follower_resp = await asyncio.wait_for(follower, 5)
+        assert follower_resp.status_code == 409
+        assert follower_resp.json()["detail"]["error"] == "IDEMPOTENCY_CONFLICT"
+        release_business.set()
+        owner_resp = await asyncio.wait_for(owner, 5)
+
+    assert owner_resp.status_code == 201
+    assert calls["n"] == 1, "different-payload request must never run the business"
+
+    detail = (await client.get(f"/v1/traces/{trace}")).json()
+    assert [s["span_id"] for s in detail["spans"]] == ["root"]
+
+    # Ledger consistency: the completed row is the owner's; one takeover.
+    row = await _fetch_idempotency_row(scope, key_name)
+    assert row.state == "COMPLETED"
+    assert row.request_hash == hash_payload(
+        scope, BatchIngestIn(**owner_payload).model_dump(mode="json")
+    )
+    assert row.status_code == 201
+    assert row.attempts == 2
+
+    # The conflicting payload still conflicts on later reuse.
+    again = await client.post(
+        f"/v1/traces/{trace}/spans", json=other_payload, headers=key
+    )
+    assert again.status_code == 409
+
+
+async def test_takeover_lock_race_owner_failure_reelects_waiting_follower(
+    client, monkeypatch
+):
+    """The same-payload follower waits on the NEW owner; when the owner's
+    business fails (placeholder committed FAILED in the same transaction),
+    the follower wins the re-election, retries the business once and
+    commits -- the key ends COMPLETED with the retried response."""
+    import asyncio
+
+    from app.main import app
+    from app.routers import ingest as ingest_router
+    from app.schemas import BatchIngestIn
+    from app.services.idempotency import hash_payload
+
+    trace = "tr-takeover-lock-retry"
+    scope = f"ingest:{trace}"
+    key_name = "takeover-lock-retry-key"
+    key = {"Idempotency-Key": key_name}
+    payload = {"spans": [span_payload("root")]}
+    stale_hash = hash_payload(scope, {"spans": [{"span_id": "stale-leftover"}]})
+    await _seed_stale_pending(scope, key_name, stale_hash)
+
+    (
+        reader_parked,
+        release_reader,
+        owner_in_business,
+        release_business,
+        owner_fingerprint_seen,
+        calls,
+    ) = _hook_takeover_lock_interleaving(
+        monkeypatch, scope, stale_hash, ingest_router, "ingest_spans",
+        fail_first_business=True,
+    )
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as c:
+        follower = asyncio.create_task(
+            c.post(f"/v1/traces/{trace}/spans", json=payload, headers=key)
+        )
+        await asyncio.wait_for(reader_parked.wait(), 5)
+        owner = asyncio.create_task(
+            c.post(f"/v1/traces/{trace}/spans", json=payload, headers=key)
+        )
+        await asyncio.wait_for(owner_in_business.wait(), 5)
+        release_reader.set()
+        # The follower judged on the current owner's fingerprint and is now
+        # blocked on the business transaction.
+        await asyncio.wait_for(owner_fingerprint_seen.wait(), 5)
+        assert not follower.done()
+        # The owner's business fails: SAVEPOINT-rolled back, the placeholder
+        # is committed FAILED, and the waiting follower re-elects itself.
+        release_business.set()
+        owner_resp, follower_resp = await asyncio.wait_for(
+            asyncio.gather(owner, follower), 5
+        )
+
+    assert owner_resp.status_code == 503  # injected transient failure
+    assert follower_resp.status_code == 201  # re-elected and retried
+    # Failed attempt + retried attempt: at most one COMMIT, never a 500
+    # from a unique-constraint collision.
+    assert calls["n"] == 2
+
+    detail = (await client.get(f"/v1/traces/{trace}")).json()
+    assert len(detail["spans"]) == 1
+
+    # Ledger consistency: the retried leader completed the key; the FAILED
+    # re-election is not a crash takeover (attempts only reflects the
+    # original stale-placeholder reclaim).
+    row = await _fetch_idempotency_row(scope, key_name)
+    assert row.state == "COMPLETED"
+    assert row.request_hash == hash_payload(
+        scope, BatchIngestIn(**payload).model_dump(mode="json")
+    )
+    assert row.status_code == 201
+    assert row.attempts == 2
+
+    replay = await client.post(f"/v1/traces/{trace}/spans", json=payload, headers=key)
+    assert replay.status_code == 201
+    assert replay.headers.get("x-idempotent-replay") == "true"
+    assert replay.json() == follower_resp.json()
+
+
+# ---------------------------------------------------------------------------
 # Real-HTTP concurrency (subprocess uvicorn, real TCP, OS threads): timing,
 # exactly-once business execution, and controlled retry after rollback.
 # ---------------------------------------------------------------------------
